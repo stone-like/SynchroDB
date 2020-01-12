@@ -1,0 +1,20 @@
+syntax = "proto3";
+package tuple;
+
+
+message TupleData{
+    enum Type{
+        INT = 0;
+        STRING = 1;
+    }
+
+    Type type = 1;
+    int32 number = 2;
+    string string = 3;
+
+}
+message Tuple{
+    uint64 updateNum = 1;
+    repeated TupleData data = 2;
+
+}
