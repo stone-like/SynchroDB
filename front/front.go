@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/stonelike/synchroDB/buffer/btree"
+
 	"github.com/stonelike/synchroDB/buffer"
 	"github.com/stonelike/synchroDB/disk/meta"
 	"github.com/stonelike/synchroDB/disk/tuple"
 )
 
 const (
-	detabaseName = "tempDatabase"
+	databaseName = "tempDatabase"
 )
 
 type frontManager struct {
@@ -28,12 +30,12 @@ type WhereStatement struct {
 
 func NewfrontManager() *frontManager {
 
-	catalog, err := meta.LoadCatalog(detabaseName)
+	catalog, err := meta.LoadCatalog(databaseName)
 	//loadできなかった場合は新たに制作
 	if err != nil {
 		catalog = meta.NewCatalog()
 		//ここで永続化する？
-		meta.SaveCatalog(detabaseName, catalog)
+		meta.SaveCatalog(databaseName, catalog)
 	}
 
 	return &frontManager{
@@ -46,6 +48,35 @@ type Column struct {
 	ColumnName  []string
 	ColumnType  []meta.ColType
 	ColumnValue []interface{}
+}
+
+//btree用にColumnを内包したpairを作ってあげる
+type BtreeColumnPair struct {
+	Key   interface{}
+	Value *Column
+}
+
+//indexに設定したcolumnNameにおいて比較したい
+func (a BtreeColumnPair) Less(b btree.Item) bool {
+	//KeyはいまのところintOrString
+
+	switch a.Key.(type) {
+	case int32:
+		aKey, okA := a.Key.(int32)
+		bKey, okB := b.(*BtreeColumnPair).Key.(int32)
+
+		if okA && okB {
+			return aKey < bKey
+		}
+
+	case string:
+		aKey, okA := a.Key.(string)
+		bKey, okB := b.(*BtreeColumnPair).Key.(string)
+		if okA && okB {
+			return aKey < bKey
+		}
+	}
+	return false
 }
 
 //updateNumはfrontでは使わないのでいらない
@@ -113,13 +144,13 @@ func (f *frontManager) CreateTable(tableName string, columnNames []string, colum
 	scheme := meta.NewScheme(tableName, columnNames, columnTypes)
 	f.catalog.AddScheme(scheme)
 	//ここでcatalog永続化すべきか、pageを永続化するのと同じタイミングでいいのか？
-	meta.SaveCatalog(detabaseName, f.catalog)
+	meta.SaveCatalog(databaseName, f.catalog)
 	return nil
 }
 
 func (f *frontManager) Join(leftTableName, rightTableName string) ([]*Column, error) {
-
-	leftColumn, err := f.Select(leftTableName)
+	//joinでのindexはまた今度
+	leftColumn, err := f.Query(leftTableName, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +159,7 @@ func (f *frontManager) Join(leftTableName, rightTableName string) ([]*Column, er
 		return nil, err
 	}
 
-	rightColumn, err := f.Select(rightTableName)
+	rightColumn, err := f.Query(rightTableName, nil)
 
 	if err != nil {
 		return nil, err
@@ -152,13 +183,13 @@ func (f *frontManager) joinTwoColumn(leftColumn, rightColumn []*Column, leftJoin
 	//rightのidとleftのidをkeyにjoinする
 	//新しいcolumnにはidを絶対入れて残りはお互いそれぞれidを除いたやつを入れていく
 
-	leftColumnNumber, isExist := f.checkColumnIsExist(leftTableName, leftJoinColumn)
+	leftColumnNumber, isExist := f.checkColumnIsExist(leftTableName, nil, leftJoinColumn)
 	if !isExist {
 
 		return nil, errors.New("left column is not exist")
 
 	}
-	rightColumnNumber, isExist := f.checkColumnIsExist(rightTableName, rightJoinColumn)
+	rightColumnNumber, isExist := f.checkColumnIsExist(rightTableName, nil, rightJoinColumn)
 	if !isExist {
 
 		return nil, errors.New("right column is not exist")
@@ -227,7 +258,16 @@ func createJoinedColumn(right, left *Column, rightColumnNumber, leftColumnNumber
 	return column
 }
 
-func (f *frontManager) checkColumnIsExist(tableName, column string) (int, bool) {
+func (f *frontManager) checkColumnIsExist(tableName string, columns []*Column, column string) (int, bool) {
+	//tableNameOrColumnでチェック
+	if tableName == "" {
+		for i, v := range columns[0].ColumnName {
+			if v == column {
+				return i, true
+			}
+		}
+	}
+
 	s := f.catalog.FetchScheme(tableName)
 	for i, v := range s.ColumnNames {
 		if v == column {
@@ -238,7 +278,7 @@ func (f *frontManager) checkColumnIsExist(tableName, column string) (int, bool) 
 }
 
 func (f *frontManager) columnSort(columns []*Column, sortPivot, tableName string) ([]*Column, error) {
-	columnNumber, isExist := f.checkColumnIsExist(tableName, sortPivot)
+	columnNumber, isExist := f.checkColumnIsExist(tableName, nil, sortPivot)
 
 	if !isExist {
 
@@ -275,34 +315,8 @@ func (f *frontManager) Where(columns []*Column, whereStatement WhereStatement) (
 	if len(columns) == 0 {
 		return nil, errors.New("columnsLen is 0")
 	}
+
 	var filteredColumns []*Column
-	//サブクエリの場合は値をとってきてからだから少し処理が異なる
-	//もうselectでtupleからcolumnに変換する過程でvalidationは終わっているのでここはいらないかな？
-
-	// var targetColumnNumber int
-	// switch whereStatement.target.(type) {
-	// case int:
-	// 	s := f.catalog.FetchScheme(tableName)
-	// 	colType, ColumnNumber, err := getTargetColumnData(whereStatement.column, s)
-	// 	targetColumnNumber = ColumnNumber
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	if colType != meta.Int {
-	// 		return nil, errors.New("whereType is different from targetType")
-	// 	}
-	// case string:
-	// 	s := f.catalog.FetchScheme(tableName)
-	// 	colType, ColumnNumber, err := getTargetColumnData(whereStatement.column, s)
-	// 	targetColumnNumber = ColumnNumber
-
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	if colType != meta.VarChar {
-	// 		return nil, errors.New("whereType is different from targetType")
-	// 	}
-	// }
 
 	//columnsとwhereStatementを受け取って、まずcolumnにwhereStatementのcolumnがあるか確認,確認したらその配列の番号を取得
 	columnNumber, err := getColumnNumberFromColumn(columns, whereStatement.column)
@@ -401,21 +415,308 @@ func getTargetColumnData(columnName string, s *meta.Scheme) (meta.ColType, int, 
 	return 0, 0, errors.New("columnName is not exists")
 }
 
+func (f *frontManager) Select(columnNames []string, columns []*Column) ([]*Column, error) {
+
+	var columnNumbers []int
+	for _, v := range columnNames {
+		columnNumber, isExist := f.checkColumnIsExist("", columns, v)
+
+		if !isExist {
+			return nil, errors.New("this column is not exist")
+		}
+		columnNumbers = append(columnNumbers, columnNumber)
+	}
+
+	//tempColumnをつくる
+	var newColumn []*Column
+
+	for _, v := range columns {
+		vv := v
+		selectedColumn := createSelectedColumn(vv, columnNumbers)
+		newColumn = append(newColumn, selectedColumn)
+	}
+
+	return newColumn, nil
+}
+
+func createSelectedColumn(column *Column, columnNumbers []int) *Column {
+	columnName := []string{}
+	columnType := []meta.ColType{}
+	columnValue := []interface{}{}
+	//columnNumberのrowだけとりたい
+	for i := range column.ColumnName {
+		if contains(columnNumbers, i) {
+			//この時だけほしい
+			columnName = append(columnName, column.ColumnName[i])
+			columnType = append(columnType, column.ColumnType[i])
+			columnValue = append(columnValue, column.ColumnValue[i])
+		}
+	}
+
+	newColumn := &Column{
+		ColumnName:  columnName,
+		ColumnType:  columnType,
+		ColumnValue: columnValue,
+	}
+
+	return newColumn
+}
+
+func contains(s []int, e int) bool {
+	for _, v := range s {
+		if e == v {
+			return true
+		}
+	}
+
+	return false
+}
+
+type JoinStatement struct {
+	leftTableName  string
+	rightTableName string
+}
+
+type SelectStatement struct {
+	selectColumns  []string
+	joinStatement  JoinStatement
+	whereStatement WhereStatement
+	from           string
+}
+
+type Option func(*SelectStatement)
+
+func (f *frontManager) SetSelectColumns(columnNames []string) Option {
+	return func(selectSt *SelectStatement) {
+		selectSt.selectColumns = columnNames
+	}
+}
+
+func (f *frontManager) SetJoinStatement(leftTableName, rightTableName string) Option {
+	return func(selectSt *SelectStatement) {
+		selectSt.joinStatement = JoinStatement{
+			leftTableName:  leftTableName,
+			rightTableName: rightTableName,
+		}
+	}
+}
+
+func (f *frontManager) SetWhereStatement(column, columnOp string, target interface{}) Option {
+	return func(selectSt *SelectStatement) {
+		selectSt.whereStatement = WhereStatement{
+			column:    column,
+			conpareOp: columnOp,
+			target:    target,
+		}
+	}
+}
+
+func (f *frontManager) SetFrom(tableName string) Option {
+	return func(selectSt *SelectStatement) {
+		selectSt.from = tableName
+	}
+}
+
+func (f *frontManager) SelectQuery(options ...Option) ([]*Column, error) {
+	selectSt := []string{}
+	selectStatement := &SelectStatement{
+		selectColumns: selectSt,
+		joinStatement: JoinStatement{
+			leftTableName:  "",
+			rightTableName: "",
+		},
+		whereStatement: WhereStatement{
+			column: "",
+		},
+		from: "",
+	}
+
+	//引数に応じてselectStatementを更新
+	for _, option := range options {
+		option(selectStatement)
+	}
+
+	if selectStatement.from == "" && selectStatement.joinStatement.leftTableName == "" {
+		//fromもしくはJoinは絶対必要
+		panic("requireTableName")
+	}
+
+	//joinがある場合はjoin→where→select
+	//ない場合はwhere→select
+
+	var newColumns []*Column
+	if selectStatement.joinStatement.leftTableName != "" {
+		//joinが指定されている
+	}
+
+	if selectStatement.whereStatement.column != "" {
+		//whereが指定されている,この場合はその指定されたcolumnにindexが付与されていればとってくるのはbtreeから
+
+		//len0はここが初めてということ
+		if len(newColumns) == 0 {
+			//whereからスタートの場合indexチェックして、queryでとってきてもうBtreeにcolumnがはいっているのでwhere通さないで終わり
+			newIndexColumns, err := f.Query(selectStatement.from, selectStatement.whereStatement)
+			if err != nil {
+				return nil, err
+			}
+			newColumns = newIndexColumns
+
+		} else {
+			newwhereColumns, err := f.Where(newColumns, selectStatement.whereStatement)
+
+			if err != nil {
+				return nil, err
+			}
+			newColumns = newwhereColumns
+		}
+
+	}
+
+	//selectこのままじゃjoinに対応してない,tableNameからcolumnがあるか確認してしまっているので、そうではなく、どうせselectはどこかからcolumnをとってきた後なので、そのcolumnにcolumnNameがあるか確認する
+	if len(selectStatement.selectColumns) != 0 {
+		//とってくるcolumnが指定されている
+		//ここが初めての場合(以前までで結果が空白になってもerrorでかえすようにすればいい)
+		if len(newColumns) == 0 {
+			newQueryColumns, err := f.Query(selectStatement.from, nil)
+			if err != nil {
+				return nil, err
+			}
+
+			newColumns = newQueryColumns
+		} else {
+			newSelectedColumn, err := f.Select(selectStatement.selectColumns, newColumns)
+
+			if err != nil {
+				return nil, err
+			}
+			newColumns = newSelectedColumn
+		}
+
+	}
+
+	//とくに条件がない場合
+	if len(newColumns) == 0 {
+		simpleColumns, err := f.Query(selectStatement.from, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		return simpleColumns, nil
+	}
+
+	return newColumns, nil
+}
+
+//これ全データとってくるだけだからselectから名前変えたほうがよさそう
 //selectを通してcolumnが返るようにする
 //selectにはselect　*　from　tableName　where　~などが必要
-func (f *frontManager) Select(tableName string) ([]*Column, error) {
+func (f *frontManager) Query(tableName string, whereStatement interface{}) ([]*Column, error) {
 	//このtableの全pageをとってきてcolumnの形なりにして[]columnみたいなかたちに整形してあげる
 	//orderByをするときはexternalMergeで
 	//emptyTupleではなくusedTupleがほしい
+	var newColumns []*Column
+	if whereStatement == nil {
+		tuples := f.buf.FetchAll(tableName, false)
 
-	tuples := f.buf.FetchAll(tableName, false)
+		newColumns, err := f.TupleToColumn(tableName, tuples)
 
-	columns, err := f.TupleToColumn(tableName, tuples)
-
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		return newColumns, nil
 	}
-	return columns, nil
+
+	whereSt, ok := whereStatement.(WhereStatement)
+
+	if !ok {
+		return nil, errors.New("wrongWhereStatementError")
+	}
+
+	//ここでwhere条件を一気に満たしてしまえばよい、idでindexを組んでいるならid>2以上のをとってくるみたいな
+	_, isIndexed := f.checkColumnHasIndex(tableName, whereSt.column)
+	//b+treeじゃないとたぶん不等号検索は意味ないので今は等号検索のみ
+	if isIndexed {
+
+		btreePair := &BtreeColumnPair{
+			Key: whereSt.target,
+		}
+		columnPair, isExist := f.buf.BTreeMap[tableName+whereSt.column].Search(btreePair)
+
+		if isExist {
+			newColumns = append(newColumns, columnPair.(*BtreeColumnPair).Value)
+			return newColumns, nil
+		}
+	}
+
+	return newColumns, errors.New("column is empty")
+
+}
+
+func (f *frontManager) checkColumnHasIndex(tableName, column string) (int, bool) {
+	s := f.catalog.FetchScheme(tableName)
+	for i, v := range s.ColumnNames {
+		if v == column {
+
+			return i, s.UseIndex[i]
+		}
+	}
+	return 0, false
+}
+
+func (f *frontManager) AddIndex(tableName, columnName string) bool {
+	columnNumber, isExist := f.checkColumnIsExist(tableName, nil, columnName)
+	if !isExist {
+		return false
+	}
+	s := f.catalog.FetchScheme(tableName)
+
+	s.UseIndex[columnNumber] = true
+	//diskに書き込み
+	meta.SaveCatalog(databaseName, f.catalog)
+
+	//diskからbtreeをとってくるかは後で検討、とりあえず選択したtableNameのcolumnにbtreeがなければつくる
+
+	return f.createBtree(tableName, columnName)
+}
+
+func (f *frontManager) createBtree(tableName, columnNane string) bool {
+	//もうすでにあれば何もしない
+	if _, ok := f.buf.BTreeMap[tableName+columnNane]; ok {
+		return true
+	}
+
+	f.buf.CreateBTree(tableName, columnNane)
+	return f.insertAllDataToBTree(tableName, columnNane)
+
+}
+
+func (f *frontManager) insertAllDataToBTree(tableName, columnName string) bool {
+	//columnNameをbtreeのkey、columnをvalueとしてbtreeを構築
+	columns, err := f.Query(tableName, nil)
+	if err != nil {
+		return false
+	}
+
+	columnNumber, isExist := f.checkColumnIsExist(tableName, nil, columnName)
+	if !isExist {
+		return false
+	}
+
+	btree := f.buf.BTreeMap[tableName+columnName]
+	for _, v := range columns {
+		vv := v
+
+		columnPair := &BtreeColumnPair{
+			//実際の値がkey、例えばidなら1とか
+
+			Key:   vv.ColumnValue[columnNumber],
+			Value: vv,
+		}
+
+		btree.Insert(columnPair)
+	}
+
+	return true
 
 }
 
